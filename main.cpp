@@ -11,10 +11,8 @@
 #include <unordered_map>
 #include <optional>
 
-// Тип статусу задачі
 enum class TaskStatus { Pending, Running, Done };
 
-// Клас задачі
 class Task {
 public:
     Task(int id, int exec_time_ms)
@@ -57,7 +55,6 @@ private:
     TaskStatus status = TaskStatus::Pending;
 };
 
-// Черга задач з обмеженням
 class TaskQueue {
 public:
     TaskQueue(size_t max_size) : max_tasks(max_size) {}
@@ -65,7 +62,13 @@ public:
     bool try_push(const std::shared_ptr<Task>& task) {
         std::unique_lock<std::mutex> lock(mutex);
         if (queue.size() >= max_tasks) return false;
+
         queue.push(task);
+
+        if (queue.size() == max_tasks && !full_start_time.has_value()) {
+            full_start_time = std::chrono::steady_clock::now();
+        }
+
         cond_var.notify_one();
         return true;
     }
@@ -78,6 +81,19 @@ public:
 
         task = queue.front();
         queue.pop();
+
+        if (queue.size() < max_tasks && full_start_time.has_value()) {
+            auto end = std::chrono::steady_clock::now();
+            long full_time = std::chrono::duration_cast<std::chrono::milliseconds>(end - *full_start_time).count();
+
+            if (min_full_time == 0 || full_time < min_full_time)
+                min_full_time = full_time;
+            if (full_time > max_full_time)
+                max_full_time = full_time;
+
+            full_start_time.reset();
+        }
+
         return true;
     }
 
@@ -87,15 +103,21 @@ public:
         cond_var.notify_all();
     }
 
+    long getMinFullTime() const { return min_full_time; }
+    long getMaxFullTime() const { return max_full_time; }
+
 private:
     std::queue<std::shared_ptr<Task>> queue;
     std::mutex mutex;
     std::condition_variable cond_var;
     size_t max_tasks;
     bool terminate_flag = false;
+
+    std::optional<std::chrono::steady_clock::time_point> full_start_time;
+    long min_full_time = 0;
+    long max_full_time = 0;
 };
 
-// Пул потоків
 class ThreadPool {
 public:
     ThreadPool(size_t num_threads = 6, size_t queue_limit = 20)
@@ -109,7 +131,6 @@ public:
         shutdown();
     }
 
-    // Додати задачу
     std::optional<int> add_task(int exec_time_ms) {
         int id = task_id_counter++;
         auto task = std::make_shared<Task>(id, exec_time_ms);
@@ -127,7 +148,6 @@ public:
         return id;
     }
 
-    // Отримати статус задачі
     TaskStatus get_task_status(int id) {
         std::lock_guard<std::mutex> lock(map_mutex);
         if (task_map.count(id)) {
@@ -136,7 +156,6 @@ public:
         return TaskStatus::Pending;
     }
 
-    // Отримати результат виконання задачі
     std::optional<int> get_task_result(int id) {
         std::lock_guard<std::mutex> lock(map_mutex);
         if (task_map.count(id) && task_map[id]->getStatus() == TaskStatus::Done) {
@@ -155,6 +174,14 @@ public:
 
     int get_completed_count() const {
         return completed_count.load();
+    }
+
+    long getQueueMaxFullTime() const {
+        return queue.getMaxFullTime();
+    }
+
+    long getQueueMinFullTime() const {
+        return queue.getMinFullTime();
     }
 
 private:
@@ -177,9 +204,10 @@ private:
     std::mutex map_mutex;
 };
 
-
 int main() {
     constexpr int total_tasks = 60;
+    constexpr int producer_count = 3;
+    std::atomic<int> global_task_id = 0;
     std::atomic<int> dropped_count = 0;
 
     ThreadPool pool;
@@ -189,19 +217,24 @@ int main() {
     std::uniform_int_distribution<> dist_time(5000, 10000);
     std::uniform_int_distribution<> delay(100, 200);
 
-    std::vector<int> task_ids;
+    std::vector<std::thread> producers;
 
-    for (int i = 0; i < total_tasks; ++i) {
-        int exec_time = dist_time(gen);
-        auto id_opt = pool.add_task(exec_time);
-        if (!id_opt) {
-            dropped_count++;
-        } else {
-            task_ids.push_back(*id_opt);
-        }
+    for (int i = 0; i < producer_count; ++i) {
+        producers.emplace_back([&]() {
+            while (true) {
+                int current_id = global_task_id.fetch_add(1);
+                if (current_id >= total_tasks) break;
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(delay(gen)));
+                int exec_time = dist_time(gen);
+                auto id_opt = pool.add_task(exec_time);
+                if (!id_opt) dropped_count++;
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay(gen)));
+            }
+        });
     }
+
+    for (auto& t : producers) t.join();
 
     std::cout << "\nAll tasks submitted. Waiting for completion...\n";
     pool.shutdown();
@@ -210,16 +243,8 @@ int main() {
     std::cout << "Total submitted: " << total_tasks << "\n";
     std::cout << "Dropped: " << dropped_count.load() << "\n";
     std::cout << "Completed: " << pool.get_completed_count() << "\n";
-
-    for (int id : task_ids) {
-        auto result = pool.get_task_result(id);
-        if (result)
-            std::cout << "Task " << id << " duration: " << *result << " ms\n";
-    }
+    std::cout << "Max time queue was full: " << pool.getQueueMaxFullTime() << " ms\n";
+    std::cout << "Min time queue was full: " << pool.getQueueMinFullTime() << " ms\n";
 
     return 0;
 }
-// TIP See CLion help at <a
-// href="https://www.jetbrains.com/help/clion/">jetbrains.com/help/clion/</a>.
-//  Also, you can try interactive lessons for CLion by selecting
-//  'Help | Learn IDE Features' from the main menu.
