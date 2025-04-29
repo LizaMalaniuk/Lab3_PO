@@ -12,6 +12,8 @@
 #include <optional>
 
 enum class TaskStatus { Pending, Running, Done };
+std::mutex cout_mutex;
+
 
 class Task {
 public:
@@ -25,7 +27,11 @@ public:
         }
 
         auto start = std::chrono::steady_clock::now();
-        std::cout << "[Task " << task_id << "] Started. Will take " << execution_time_ms << " ms.\n";
+        {
+            std::lock_guard<std::mutex> lock(cout_mutex);
+            std::cout << "[Task " << task_id << "] Started. Will take " << execution_time_ms << " ms.\n";
+        }
+
         std::this_thread::sleep_for(std::chrono::milliseconds(execution_time_ms));
         auto end = std::chrono::steady_clock::now();
 
@@ -35,7 +41,10 @@ public:
             status = TaskStatus::Done;
         }
 
-        std::cout << "[Task " << task_id << "] Finished in " << duration << " ms.\n";
+        {
+            std::lock_guard<std::mutex> lock(cout_mutex);
+            std::cout << "[Task " << task_id << "] Finished in " << duration << " ms.\n";
+        }
     }
 
     int getId() const { return task_id; }
@@ -136,6 +145,7 @@ public:
         auto task = std::make_shared<Task>(id, exec_time_ms);
 
         if (!queue.try_push(task)) {
+            std::lock_guard<std::mutex> lock(cout_mutex);
             std::cout << "[Task " << id << "] Dropped (queue full).\n";
             return std::nullopt;
         }
@@ -184,15 +194,40 @@ public:
         return queue.getMinFullTime();
     }
 
+    void pause() {
+        paused = true;
+        std::lock_guard<std::mutex> lock(cout_mutex);
+        std::cout << "[ThreadPool] Paused.\n";
+
+    }
+
+    void resume() {
+        {
+            std::lock_guard<std::mutex> lock(pause_mutex);
+            paused = false;
+        }
+        pause_cv.notify_all();
+        std::lock_guard<std::mutex> lock(cout_mutex);
+        std::cout << "[ThreadPool] Resumed.\n";
+    }
+
+
 private:
     void worker_loop() {
         while (true) {
+            {
+                std::unique_lock<std::mutex> lock(pause_mutex);
+                pause_cv.wait(lock, [&]() { return !paused || terminate_flag; });
+            }
+
             std::shared_ptr<Task> task;
             if (!queue.pop(task)) break;
+
             (*task)();
             completed_count++;
         }
     }
+
 
     TaskQueue queue;
     std::vector<std::thread> workers;
@@ -202,6 +237,11 @@ private:
 
     std::unordered_map<int, std::shared_ptr<Task>> task_map;
     std::mutex map_mutex;
+
+    std::atomic<bool> paused = false;
+    std::mutex pause_mutex;
+    std::condition_variable pause_cv;
+
 };
 
 int main() {
@@ -234,9 +274,18 @@ int main() {
         });
     }
 
+
     for (auto& t : producers) t.join();
 
+
     std::cout << "\nAll tasks submitted. Waiting for completion...\n";
+
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    pool.pause();
+    std::cout << "\n[Main] Pool paused for 5 seconds...\n";
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    pool.resume();
+
     pool.shutdown();
 
     std::cout << "\n=== Report ===\n";
